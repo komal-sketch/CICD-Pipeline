@@ -1,0 +1,412 @@
+# CI/CD with Jenkins (Controller/Agent), Docker, Docker Hub, and AWS EC2
+
+This README is a guide for setting up a Jenkins Declarative Pipeline that:
+- pulls source from **GitHub**
+- builds a **Docker** image
+- (optionally) runs tests
+- pushes the image to **Docker Hub**
+- deploys the container on an **EC2** agent
+
+It includes **Jenkins UI components**, **controller/agent architecture**, **credentials binding**, **GitHub webhook**.
+
+---
+
+## 1) Jenkins UI — What You See and Why It Matters
+
+- **Dashboard**  
+  High-level view of jobs and folders. From here you create new jobs, see red/green status, and drill into details.
+
+- **New Item**  
+  Create **Pipeline** (recommended), **Multibranch Pipeline**, or **Freestyle**. For modern CI/CD, prefer Declarative Pipeline (Jenkinsfile in repo).
+
+- **Build Queue & Executors**  
+  Shows queued builds and which **agent** (node) is executing what. Useful when you scale horizontally with more agents.
+
+- **Job Page (Pipeline view / Blue Ocean)**  
+  Visualizes stages, parallel branches, logs, artifacts, and replay options. Blue Ocean is optional but gives clean stage visualization.
+
+- **Manage Jenkins**  
+  The admin heart: Plugins, Credentials, Global Tool Configuration (JDK, Git, Docker), Security, System Logs, Nodes/Clouds.
+
+- **Credentials**  
+  Secret storage for Docker Hub, AWS keys, GitHub PATs, etc. Never hardcode secrets in pipeline code.
+
+- **Nodes / Agents**  
+  Configure static agents or ephemeral cloud agents. Label nodes (e.g., `vinod`) and bind pipelines to labels.
+
+---
+
+## 2) Why Controller (Master) and Agent?
+
+- **Controller** (formerly “master”) runs Jenkins UI, schedules builds, stores job configs, renders logs, manages webhooks and plugins.  
+- **Agents** (workers/nodes) do the actual work: building, testing, packaging, deploying. They’re closer to your runtime tools (Docker, Java, Python, Node, etc.).
+
+**Key points**
+- You **do not install Jenkins** on agents. Agents only need a Java runtime (to connect with JNLP/SSH) **and** the build tools you require (e.g., Docker).
+- Keep controllers lean (plugins, credentials, configs). Push heavy workloads to agents. Scale by adding/removing agents.
+
+---
+
+## 3) Declarative Pipeline — What and Why
+
+A **Declarative Pipeline** is a structured, opinionated way to define CI/CD with a `pipeline {}` block. It’s stable, readable, and easy to lint.  
+Key constructs:
+- `agent { label '...' }`
+- `stages { stage('Name') { steps { ... } } }`
+- `environment { ... }`
+- `post { success { ... } failure { ... } }`
+- `options { ... } parameters { ... } tools { ... }`
+
+Compared to scripted pipelines, declarative forces a consistent structure and reduces surprises.
+
+---
+
+## 4) Real-World Architecture
+
+- **Repo**: GitHub (main branch)  
+- **Controller**: Jenkins server (UI + orchestration)  
+- **Agent**: EC2 (Ubuntu) with Docker installed and a node label (e.g., `vinod`)  
+- **Registry**: Docker Hub (private or public)  
+- **Runtime**: Docker Compose (dev/stage/prod variants) or orchestration (ECS/EKS/Kubernetes) for production
+
+Why **Compose** (or K8s) over raw `docker run`?
+- Service graphs (app + db + cache)
+- Versioned, repeatable deployments
+- Easier env var, volumes, networks, healthchecks
+- Blue/green or rolling patterns are easier to standardize
+
+---
+
+## 5) Agent (EC2) Preparation
+
+Install Docker on the **agent**:
+
+    sudo apt-get update
+    sudo apt-get install -y docker.io
+    sudo usermod -aG docker $USER
+    # If Jenkins agent runs as 'jenkins' user:
+    sudo usermod -aG docker jenkins
+    sudo systemctl enable docker
+    sudo systemctl start docker
+
+(Logout/login to refresh group membership.)
+
+Optional: **Docker Compose v2**
+
+    sudo apt-get install -y docker-compose-v2
+    # Will be available as `docker compose`
+
+Install **Java** (for the Jenkins agent):
+
+    sudo apt-get install -y openjdk-17-jre
+
+Label your node in Jenkins as `vinod` (Manage Jenkins → Nodes → Configure → Labels).
+
+---
+
+## 6) Minimal Project Files
+
+**.gitignore** (Git-side)
+
+    .DS_Store
+    node_modules/
+    dist/
+    build/
+    .env
+    .venv
+    *.log
+    *.tmp
+
+**.dockerignore** (Docker build context hygiene)
+
+    .git
+    .github
+    .env
+    node_modules
+    dist
+    build
+    *.log
+    *.tmp
+    data/
+    mysql/
+
+**docker-compose.yml** 
+
+    version: "3.9"
+    services:
+      app:
+        image: notes-app:latest
+        container_name: notes-app
+        ports:
+          - "8000:8000"
+        env_file:
+          - .env
+        restart: unless-stopped
+        healthcheck:
+          test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+          interval: 30s
+          timeout: 5s
+          retries: 5
+
+**Dockerfile** (example Python/Django)
+
+    FROM python:3.12-slim
+    WORKDIR /app
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+    COPY . .
+    EXPOSE 8000
+    CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+
+---
+
+## 7) Jenkinsfile (Declarative) — GitHub → Build → Test → Push → Deploy
+
+Place this **Jenkinsfile** in your repo root. Update repo URL, credentialsId, image name, etc.
+
+    pipeline {
+      agent { label "vinod" }
+
+      environment {
+        APP_IMAGE          = "notes-app"
+        APP_TAG            = "latest"
+        DOCKERHUB_REPO     = "your-dockerhub-username/notes-app"
+        // example of pinning compose file if you have variants:
+        COMPOSE_FILE       = "docker-compose.yml"
+      }
+
+      options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+        timeout(time: 30, unit: 'MINUTES')
+      }
+
+      stages {
+
+        stage("Checkout") {
+          steps {
+            echo "Cloning code from GitHub..."
+            git url: "https://github.com/komal-sketch/django-notes-app.git", branch: "main"
+            echo "Clone complete."
+          }
+        }
+
+        stage("Build Image") {
+          steps {
+            echo "Building Docker image..."
+            sh """
+                docker build -t ${APP_IMAGE}:${APP_TAG} .
+            """
+          }
+        }
+
+        stage("Test (optional)") {
+          when { expression { return false } } // toggle true/false as needed
+          steps {
+            echo "Running containerized tests..."
+            sh """
+                docker run --rm ${APP_IMAGE}:${APP_TAG} pytest
+            """
+          }
+        }
+
+        stage("Login & Push Image") {
+          steps {
+            echo "Pushing image to Docker Hub with Jenkins credentials binding..."
+            withCredentials([usernamePassword(
+              credentialsId: "dockerhubcred",
+              usernameVariable: "DOCKER_USER",
+              passwordVariable: "DOCKER_PASS"
+            )]) {
+              sh """
+                  echo "${DOCKER_PASS}" | docker login -u "${DOCKER_USER}" --password-stdin
+                  docker tag ${APP_IMAGE}:${APP_TAG} ${DOCKER_USER}/${APP_IMAGE}:${APP_TAG}
+                  docker push ${DOCKER_USER}/${APP_IMAGE}:${APP_TAG}
+              """
+            }
+          }
+        }
+
+        stage("Deploy (Compose)") {
+          steps {
+            echo "Deploying on agent using Docker Compose..."
+            sh """
+                docker compose -f ${COMPOSE_FILE} pull || true
+                # ensure the compose file references ${DOCKER_USER}/${APP_IMAGE}:${APP_TAG} OR override here:
+                docker compose -f ${COMPOSE_FILE} down
+                # Option A) if compose uses a static image name:
+                # docker compose -f ${COMPOSE_FILE} up -d
+                # Option B) override image at runtime (Compose v2 supports profiles/overrides):
+                # docker compose -f ${COMPOSE_FILE} up -d --build
+                docker compose -f ${COMPOSE_FILE} up -d
+            """
+          }
+        }
+      }
+
+      post {
+        success {
+          echo "Pipeline succeeded ✅"
+        }
+        failure {
+          echo "Pipeline failed ❌ — check stage logs."
+        }
+        always {
+          echo "Cleaning up dangling images..."
+          sh 'docker image prune -f || true'
+        }
+      }
+    }
+
+**Notes**
+- The **credentialsId** `dockerhubcred` must exist in Jenkins → Manage Jenkins → Credentials (username+password).  
+- If your `docker-compose.yml` references `image: your-dockerhub-username/notes-app:latest`, the `pull` step will fetch the pushed image automatically.
+- For **zero-downtime** in production, use a load balancer or blue/green strategy. Compose can do this with multiple services + a reverse proxy. For enterprise, consider ECS/EKS/Kubernetes.
+
+---
+
+## 8) Credentials Binding — How It Works
+
+- Store secrets in **Manage Jenkins → Credentials → (global)**.  
+- In the pipeline, wrap shell steps with `withCredentials([usernamePassword(...)])`.  
+- Jenkins injects the values into environment variables **for that block only**, and masks them in logs.
+
+Advantages:
+- No hardcoding secrets
+- Rotatable & revocable
+- Auditable in Jenkins
+
+---
+
+## 9) GitHub Webhook — Auto-Build on Push
+
+1. In GitHub repo → **Settings** → **Webhooks** → **Add webhook**  
+2. Payload URL:
+
+       http://<jenkins-controller>:8080/github-webhook/
+3. Content type: `application/json`  
+4. Events: **Just the push event** (or add PR events if you want)  
+5. In Jenkins job config, enable “GitHub hook trigger for GITScm polling” (for classic jobs) or rely on Multibranch discovery.
+
+**Firewall**: Ensure your Jenkins controller is reachable by GitHub (public URL or GitHub App/Cloud proxy).
+
+---
+
+## 10) Production Notes — What We Actually Do
+
+- **Don’t use `docker run` in production**  
+  It’s fine for quick tests, but production needs:
+  - declarative definitions (Compose/K8s manifests)
+  - healthchecks + restart policies
+  - externalized configs and secrets
+  - rollbacks and rollout controls
+
+- **Compose profiles per environment**  
+  Use separate files:
+  
+      docker-compose.yml
+      docker-compose.prod.yml
+  
+  Then:
+  
+      docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+- **Logging & Monitoring**  
+  Aggregate logs (CloudWatch, ELK, Loki). Monitor container health (Prometheus/Grafana). Add alerts.
+
+- **Security**  
+  - Pull only from trusted registries
+  - Pin base images by digest
+  - Scan images (Trivy/Grype)
+  - Least-privilege IAM for EC2/ECR
+  - Keep Docker & kernel up to date
+
+---
+
+## 11) Common Errors & Fixes
+
+- **Build error: wrong `docker push` syntax**  
+  Use:
+  
+      docker push <repo>/<image>:<tag>
+  
+  Not:
+  
+      docker <repo>/push <image>:<tag>   # ❌ incorrect
+
+- **Permission denied to Docker socket**  
+  Add your Jenkins agent user to the `docker` group and relogin, or use rootless Docker/socket proxy.
+
+- **Image is huge or slow to build**  
+  Use `.dockerignore`. Multi-stage builds. Pinning dependencies. Cache strategically.
+
+- **Webhooks not triggering**  
+  Verify payload URL reaches Jenkins, check reverse proxies, CSRF settings, and GitHub delivery logs.
+
+- **“No such label vinod”**  
+  The agent node must be created in Jenkins and labeled `vinod`. (Manage Jenkins → Nodes)
+
+- **“docker: command not found” on agent**  
+  Ensure Docker is installed on the *agent*, not only on controller.
+
+- **Compose v2 not found**  
+  Install `docker-compose-v2`, or use `docker compose` baked into newer Docker packages.
+
+---
+
+## 12) End-to-End Flow Recap
+
+1. **Push** to GitHub `main`.  
+2. **GitHub Webhook** hits Jenkins.  
+3. Jenkins (Controller) **schedules** build on the **EC2 agent** labeled `vinod`.  
+4. Agent **checks out** repo, **builds** Docker image, optionally **tests**.  
+5. Jenkins **logs into Docker Hub** via credentials, **pushes** the image.  
+6. **Deploy** via Compose on the agent (pulls the image and restarts services).  
+7. App is live on EC2 (e.g., `http://<ec2-public-ip>:8000` behind security group rules or reverse proxy).
+
+---
+
+## 13) FAQ
+
+- **Q: “We don’t need to set up Jenkins on the agent?”**  
+  A: Correct. Agents only need Java (to run the Jenkins agent) and your build tools (e.g., Docker). The Jenkins **controller** hosts Jenkins itself.
+
+- **Q: “Why Declarative Pipeline?”**  
+  A: Standard structure, easier to read, guard rails for teams, good plugin ecosystem (linting, visualization).
+
+- **Q: “Where do I put secrets?”**  
+  A: In **Jenkins Credentials**. Bind them with `withCredentials`. Never commit secrets.
+
+- **Q: “Can I deploy on multiple EC2s?”**  
+  A: Yes. Use multiple agents, or use one agent that orchestrates remote hosts (via SSH/Ansible) or adopt ECS/EKS to scale services properly.
+
+---
+
+## 14) Quickstart Commands (Agent)
+
+Install essentials (Ubuntu):
+
+    sudo apt-get update
+    sudo apt-get install -y openjdk-17-jre docker.io docker-compose-v2 git curl
+    sudo usermod -aG docker jenkins
+    sudo systemctl enable docker
+    sudo systemctl start docker
+
+Optional: verify:
+
+    docker --version
+    docker compose version
+    java -version
+
+---
+
+## 15) Next Steps
+
+- Add **branch-based** builds (Multibranch Pipeline).
+- Introduce **stages** for QA, Staging, Prod with approvals.
+- Add **unit/integration tests** and SAST/DAST.
+- Consider **ECR + ECS/EKS** if running fully on AWS.
+- Wire **Grafana/Prometheus** for metrics and **Loki/ELK** for logs.
+
+---
