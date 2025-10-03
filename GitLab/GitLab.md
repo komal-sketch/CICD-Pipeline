@@ -24,7 +24,7 @@
 - [20. Real-World GitLab Errors & Scenarios (with fixes)](#20-realworld-gitlab-errors--scenarios-with-fixes)
 - [21. Reference Pipeline Snippets (Your Examples: reviewed & corrected)](#21-reference-pipeline-snippets-your-examples-reviewed--corrected)
 - [22. Bonus Topics (Monorepos, Review Apps, Caching, DIND, K8s)](#22-bonus-topics-monorepos-review-apps-caching-dind-k8s)
-- [23. Interview Questions (Beginner → 5 Years) with Answers](#23-interview-questions-beginner--5-years-with-answers)
+- [23. Interview Questions (Beginner → 5 Years) with Answers](#questions)
 
 ---
 
